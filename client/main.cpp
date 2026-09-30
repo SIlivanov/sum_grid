@@ -1,12 +1,13 @@
 #include <iostream>
 #include <string>
 #include "Worker.hpp"
+#include "Requester.hpp"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cout << "Использование:\n";
-        std::cout << "  Режим вычислителя: " << argv[0] << " --worker [host] [port]\n";
-        std::cout << "  Режим заказчика:   " << argv[0] << " --request <type> <N> [host] [port]\n";
+        std::cout << "  Режим воркера:   " << argv[0] << " --worker [host] [port]\n";
+        std::cout << "  Режим заказчика: " << argv[0] << " --request <type: 1|2> <N> [host] [port]\n";
         return 1;
     }
 
@@ -25,11 +26,24 @@ int main(int argc, char* argv[]) {
         }
     } 
     else if (mode == "--request") {
-        std::cout << "[REQUESTER] ...\n"; // допилить
-    } 
-    else {
-        std::cerr << "Неизвестный режим: " << mode << "\n";
-        return 1;
+        if (argc < 4) {
+            std::cerr << "Укажите тип ряда (1=Pi, 2=Zeta) и N (число итераций)!\n";
+            std::cerr << "Пример: " << argv[0] << " --request 1 1000000000\n";
+            return 1;
+        }
+
+        uint32_t series_type = std::stoul(argv[2]);
+        uint64_t n = std::stoull(argv[3]);
+        std::string host = (argc > 4) ? argv[4] : "127.0.0.1";
+        int port = (argc > 5) ? std::stoi(argv[5]) : 8080;
+
+        try {
+            Requester req(host, port);
+            req.send_job(series_type, n);
+        } catch (const std::exception& e) {
+            std::cerr << "[REQUESTER ERROR] " << e.what() << std::endl;
+            return 1;
+        }
     }
 
     return 0;
