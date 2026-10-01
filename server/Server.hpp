@@ -4,18 +4,29 @@
 #include <thread>
 #include <vector>
 #include <mutex>
-#include <chrono>
-#include <iomanip>
+#include <condition_variable>
+#include <queue>
 #include <asio.hpp>
 #include "Protocol.hpp"
 #include "MathSeries.hpp"
 
 using asio::ip::tcp;
 
-struct WorkerSession {
+// TODO: РАЗБИТЬ ПРОГРАММУ НА ФУНКЦИИ, ЧТОБЫ НЕБЫЛО СЛИШКОМ МНОГО ВЛОЖЕНИЙ
+
+struct SubTask {
+    uint32_t task_id;
+    uint32_t series_type;
+    uint64_t k_start;
+    uint64_t k_end;
+};
+
+struct WorkerInfo {
     uint32_t id;
     std::shared_ptr<tcp::socket> socket;
     uint32_t cores;
+    bool is_busy = false;
+    bool is_alive = true;
 };
 
 class Server {
@@ -23,7 +34,7 @@ public:
     Server(short port) 
         : acceptor_(io_context_, tcp::endpoint(tcp::v4(), port)) 
     {
-        std::cout << "[SERVER] Listening on port " << port << std::endl;
+        std::cout << "[SERVER] Resilient Server listening on port " << port << std::endl;
         accept_connections();
     }
 
@@ -52,16 +63,15 @@ private:
                 RegisterWorkerMsg msg;
                 asio::read(*socket, asio::buffer(&msg, sizeof(RegisterWorkerMsg)));
 
-                uint32_t worker_id;
+                uint32_t id;
                 {
-                    std::lock_guard<std::mutex> lock(workers_mtx_);
-                    worker_id = next_worker_id_++;
-                    workers_.push_back({worker_id, socket, msg.cpu_cores});
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    id = next_worker_id_++;
+                    workers_.push_back({id, socket, msg.cpu_cores, false, true});
                 }
-                std::cout << "[SERVER] Worker #" << worker_id 
-                          << " registered with " << msg.cpu_cores << " CPU cores.\n";
+                std::cout << "[SERVER] Worker #" << id << " connected (" << msg.cpu_cores << " threads)\n";
 
-                // Держим поток сессии открытым, пока сокет жив
+                // Поток держит соединение открытым
                 while (socket->is_open()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
@@ -70,89 +80,163 @@ private:
                 JobRequestMsg job;
                 asio::read(*socket, asio::buffer(&job, sizeof(JobRequestMsg)));
 
-                std::cout << "\n[SERVER] New job received: Type=" << job.series_type 
+                std::cout << "\n[SERVER] New Job: Type=" << job.series_type 
                           << ", N=" << job.total_n << "\n";
 
-                process_job(socket, job);
+                execute_job_resilient(socket, job);
             }
         } catch (const std::exception& e) {
-            // Клиент отключился
+            // Отключение клиента
         }
     }
 
-    void process_job(std::shared_ptr<tcp::socket> requester_sock, const JobRequestMsg& job) {
-        std::vector<WorkerSession> available_workers;
+    void execute_job_resilient(std::shared_ptr<tcp::socket> req_socket, const JobRequestMsg& job) {
+        std::vector<WorkerInfo*> active_workers;
         {
-            std::lock_guard<std::mutex> lock(workers_mtx_);
-            available_workers = workers_;
+            std::lock_guard<std::mutex> lock(mtx_);
+            for (auto& w : workers_) {
+                if (w.is_alive) active_workers.push_back(&w);
+            }
         }
 
-        if (available_workers.empty()) {
-            std::cerr << "[SERVER] Error: No workers available to calculate!\n";
+        if (active_workers.empty()) {
+            std::cerr << "[SERVER] Error: No workers available!\n";
             return;
         }
 
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        // Считаем общее количество доступных ядер во всей сети
-        uint32_t total_network_cores = 0;
-        for (const auto& w : available_workers) {
-            total_network_cores += w.cores;
+        // Формируем очередь подзадач для воркеров
+        std::queue<SubTask> task_queue;
+        uint32_t num_chunks = active_workers.size() * 2; // Режем на порции с запасом
+        uint64_t chunk_size = (job.total_n + 1) / num_chunks;
+        
+        uint32_t tid = 1;
+        for (uint32_t i = 0; i < num_chunks; ++i) {
+            uint64_t start = i * chunk_size;
+            uint64_t end = (i == num_chunks - 1) ? job.total_n : (start + chunk_size - 1);
+            task_queue.push({tid++, job.series_type, start, end});
         }
 
-        std::cout << "[SERVER] Distributing job across " << available_workers.size() 
-                  << " worker(s) (total " << total_network_cores << " cores)...\n";
-
-        // Делим диапазон [0, total_n] пропорционально ядрам воркеров
-        uint64_t current_k = 0;
         double accumulated_sum = 0.0;
+        std::mutex job_mtx;
+        std::condition_variable job_cv;
+        size_t tasks_in_progress = 0;
 
-        for (size_t i = 0; i < available_workers.size(); ++i) {
-            auto& worker = available_workers[i];
-            
-            // Доля элементов на воркера
-            uint64_t worker_chunk = (job.total_n * worker.cores) / total_network_cores;
-            uint64_t k_start = current_k;
-            uint64_t k_end = (i == available_workers.size() - 1) ? job.total_n : (k_start + worker_chunk - 1);
-            current_k = k_end + 1;
+        // Поток-диспетчер задач
+        std::thread scheduler([&]() {
+            while (true) {
+                SubTask cur_task;
+                WorkerInfo* chosen_worker = nullptr;
 
-            // Отправляем задачу воркеру
-            Header task_hdr{MessageType::TASK_ASSIGN, sizeof(TaskAssignMsg)};
-            TaskAssignMsg task_body{static_cast<uint32_t>(i + 1), job.series_type, k_start, k_end};
+                {
+                    std::unique_lock<std::mutex> lock(job_mtx);
+                    if (task_queue.empty() && tasks_in_progress == 0) {
+                        job_cv.notify_all();
+                        break; // Все задачи выполнены!
+                    }
 
-            asio::write(*worker.socket, asio::buffer(&task_hdr, sizeof(Header)));
-            asio::write(*worker.socket, asio::buffer(&task_body, sizeof(TaskAssignMsg)));
+                    if (!task_queue.empty()) {
+                        // Ищем свободного живого воркера
+                        std::lock_guard<std::mutex> wlock(mtx_);
+                        for (auto* w : active_workers) {
+                            if (w->is_alive && !w->is_busy) {
+                                chosen_worker = w;
+                                break;
+                            }
+                        }
 
-            // Ждем завершения от воркера (в этом базовом шаге синхронно)
-            Header resp_hdr;
-            asio::read(*worker.socket, asio::buffer(&resp_hdr, sizeof(Header)));
-            if (resp_hdr.type == MessageType::TASK_COMPLETED) {
-                TaskCompletedMsg comp_msg;
-                asio::read(*worker.socket, asio::buffer(&comp_msg, sizeof(TaskCompletedMsg)));
-                accumulated_sum += comp_msg.final_sum;
+                        if (chosen_worker) {
+                            cur_task = task_queue.front();
+                            task_queue.pop();
+                            chosen_worker->is_busy = true;
+                            tasks_in_progress++;
+                        }
+                    }
+                }
+
+                if (chosen_worker) {
+                    // Запускаем обслуживание задачи на выбранном воркере
+                    std::thread([&, chosen_worker, cur_task]() {
+                        try {
+                            Header hdr{MessageType::TASK_ASSIGN, sizeof(TaskAssignMsg)};
+                            TaskAssignMsg msg{cur_task.task_id, cur_task.series_type, cur_task.k_start, cur_task.k_end};
+
+                            asio::write(*chosen_worker->socket, asio::buffer(&hdr, sizeof(Header)));
+                            asio::write(*chosen_worker->socket, asio::buffer(&msg, sizeof(TaskAssignMsg)));
+
+                            // Ждем ответа от воркера
+                            Header resp_hdr;
+                            asio::read(*chosen_worker->socket, asio::buffer(&resp_hdr, sizeof(Header)));
+
+                            if (resp_hdr.type == MessageType::TASK_COMPLETED) {
+                                TaskCompletedMsg cmsg;
+                                asio::read(*chosen_worker->socket, asio::buffer(&cmsg, sizeof(TaskCompletedMsg)));
+
+                                std::lock_guard<std::mutex> lock(job_mtx);
+                                accumulated_sum += cmsg.final_sum;
+                                tasks_in_progress--;
+                                chosen_worker->is_busy = false;
+                                std::cout << "[SERVER] Task #" << cur_task.task_id << " successfully completed.\n";
+                            } 
+                            else if (resp_hdr.type == MessageType::CHECKPOINT) {
+                                CheckpointMsg chk;
+                                asio::read(*chosen_worker->socket, asio::buffer(&chk, sizeof(CheckpointMsg)));
+
+                                std::lock_guard<std::mutex> lock(job_mtx);
+                                accumulated_sum += chk.partial_sum;
+                                chosen_worker->is_alive = false; // Воркер выключился
+                                chosen_worker->is_busy = false;
+
+                                std::cout << "\n>>> [FAULT TOLERANCE] Worker #" << chosen_worker->id 
+                                          << " aborted Task #" << cur_task.task_id << "!\n";
+                                std::cout << ">>> Saved partial sum: " << chk.partial_sum << " up to k=" << chk.current_k << "\n";
+
+                                // Если остался недосчитанный хвост - кладем его обратно в очередь!
+                                if (chk.current_k < cur_task.k_end) {
+                                    SubTask remainder{cur_task.task_id, cur_task.series_type, chk.current_k + 1, cur_task.k_end};
+                                    std::cout << ">>> Reassigning remainder [" << remainder.k_start 
+                                              << " .. " << remainder.k_end << "] to queue!\n\n";
+                                    task_queue.push(remainder);
+                                }
+                                tasks_in_progress--;
+                            }
+                        } catch (...) {
+                            // Аварийный обрыв соединения воркера
+                            std::lock_guard<std::mutex> lock(job_mtx);
+                            chosen_worker->is_alive = false;
+                            chosen_worker->is_busy = false;
+                            task_queue.push(cur_task); // Возвращаем задачу целиком
+                            tasks_in_progress--;
+                        }
+                    }).detach();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
             }
-        }
+        });
+
+        // Ждем завершения работы планировщика
+        scheduler.join();
 
         auto end_time = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(end_time - start_time).count();
-
-        // Финализируем формулу (например, домножаем на 4 для числа Пи)
         double final_result = MathSeries::finalize(job.series_type, accumulated_sum);
 
-        std::cout << "[SERVER] Job finished in " << elapsed 
-                  << "s. Result: " << final_result << ". Notifying requester...\n";
+        std::cout << "\n[SERVER] All tasks finished! Final Result: " << final_result 
+                  << " (" << elapsed << " sec)\n";
 
         // Отправляем ответ заказчику
         Header finish_hdr{MessageType::JOB_FINISHED, sizeof(JobFinishedMsg)};
         JobFinishedMsg finish_msg{final_result, elapsed};
 
-        asio::write(*requester_sock, asio::buffer(&finish_hdr, sizeof(Header)));
-        asio::write(*requester_sock, asio::buffer(&finish_msg, sizeof(JobFinishedMsg)));
+        asio::write(*req_socket, asio::buffer(&finish_hdr, sizeof(Header)));
+        asio::write(*req_socket, asio::buffer(&finish_msg, sizeof(JobFinishedMsg)));
     }
 
     asio::io_context io_context_;
     tcp::acceptor acceptor_;
-    std::mutex workers_mtx_;
-    std::vector<WorkerSession> workers_;
+    std::mutex mtx_;
+    std::vector<WorkerInfo> workers_;
     uint32_t next_worker_id_ = 1;
 };

@@ -1,9 +1,21 @@
 #include <iostream>
 #include <string>
+#include <csignal>
 #include "Worker.hpp"
 #include "Requester.hpp"
 
+// Обработчик сигнала Ctrl+C
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        std::cout << "\n[SIGNAL] SIGINT received! Graceful shutdown initiated...\n";
+        g_stop_requested = true;
+    }
+}
+
 int main(int argc, char* argv[]) {
+    // Регистрируем перехват Ctrl+C
+    std::signal(SIGINT, signal_handler);
+
     if (argc < 2) {
         std::cout << "Использование:\n";
         std::cout << "  Режим воркера:   " << argv[0] << " --worker [host] [port]\n";
@@ -27,8 +39,7 @@ int main(int argc, char* argv[]) {
     } 
     else if (mode == "--request") {
         if (argc < 4) {
-            std::cerr << "Укажите тип ряда (1=Pi, 2=Zeta) и N (число итераций)!\n";
-            std::cerr << "Пример: " << argv[0] << " --request 1 1000000000\n";
+            std::cerr << "Укажите тип ряда (1=Pi, 2=Zeta) и N!\n";
             return 1;
         }
 

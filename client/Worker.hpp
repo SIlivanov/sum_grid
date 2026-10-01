@@ -4,12 +4,17 @@
 #include <string>
 #include <vector>
 #include <future>
+#include <atomic>
+#include <csignal>
 #include <asio.hpp>
 #include "Protocol.hpp"
 #include "MathSeries.hpp"
 #include "ThreadPool.hpp"
 
 using asio::ip::tcp;
+
+// Глобальный флаг для перехвата сигнала Ctrl+C
+inline std::atomic<bool> g_stop_requested{false};
 
 class Worker {
 public:
@@ -42,7 +47,7 @@ private:
 
     void listen_server() {
         try {
-            while (true) {
+            while (!g_stop_requested) {
                 Header header;
                 asio::read(socket_, asio::buffer(&header, sizeof(Header)));
 
@@ -50,50 +55,71 @@ private:
                     TaskAssignMsg task;
                     asio::read(socket_, asio::buffer(&task, sizeof(TaskAssignMsg)));
 
-                    std::cout << "\n[WORKER] Received Task #" << task.task_id 
+                    std::cout << "\n[WORKER] Accepted Task #" << task.task_id 
                               << " Range: [" << task.k_start << " .. " << task.k_end << "]\n";
 
                     compute_task(task);
                 }
             }
         } catch (const std::exception& e) {
-            std::cout << "[WORKER] Connection closed: " << e.what() << "\n";
+            if (!g_stop_requested) {
+                std::cout << "[WORKER] Disconnected: " << e.what() << "\n";
+            }
         }
     }
 
     void compute_task(const TaskAssignMsg& task) {
-        uint64_t total_elements = task.k_end - task.k_start + 1;
-        uint64_t chunk_per_thread = total_elements / cores_;
+        // Размер микро-батча для проверки Ctrl+C
+        const uint64_t BATCH_SIZE = 10'000'000;
+        double total_task_sum = 0.0;
+        uint64_t last_processed_k = task.k_start;
 
-        std::vector<std::future<double>> futures;
+        for (uint64_t batch_start = task.k_start; batch_start <= task.k_end; batch_start += BATCH_SIZE) {
+            // Проверяем, не нажал ли пользователь Ctrl+C
+            if (g_stop_requested) {
+                std::cout << "\n[WORKER] Interrupt detected! Halting computation...\n";
+                std::cout << "[WORKER] Sending checkpoint to server: reached k=" 
+                          << last_processed_k << ", partial_sum=" << total_task_sum << "\n";
 
-        auto start_time = std::chrono::high_resolution_clock::now();
+                // Отправляем серверу контрольную точку с флагом отмены
+                Header chk_hdr{MessageType::CHECKPOINT, sizeof(CheckpointMsg)};
+                CheckpointMsg chk_msg{task.task_id, last_processed_k, total_task_sum, 1 /* is_aborted */};
 
-        // Распределяем работу потоками
-        for (uint32_t i = 0; i < cores_; ++i) {
-            uint64_t sub_start = task.k_start + i * chunk_per_thread;
-            uint64_t sub_end = (i == cores_ - 1) ? task.k_end : (sub_start + chunk_per_thread - 1);
+                asio::write(socket_, asio::buffer(&chk_hdr, sizeof(Header)));
+                asio::write(socket_, asio::buffer(&chk_msg, sizeof(CheckpointMsg)));
+                
+                socket_.close();
+                return;
+            }
 
-            futures.push_back(pool_.enqueue([task, sub_start, sub_end]() {
-                return MathSeries::calculate_range(task.series_type, sub_start, sub_end);
-            }));
+            uint64_t batch_end = std::min(batch_start + BATCH_SIZE - 1, task.k_end);
+            
+            // Распараллеливаем текущий батч по ядрам
+            uint64_t total_elements = batch_end - batch_start + 1;
+            uint64_t chunk_per_thread = total_elements / cores_;
+            std::vector<std::future<double>> futures;
+
+            for (uint32_t i = 0; i < cores_; ++i) {
+                uint64_t sub_start = batch_start + i * chunk_per_thread;
+                uint64_t sub_end = (i == cores_ - 1) ? batch_end : (sub_start + chunk_per_thread - 1);
+
+                futures.push_back(pool_.enqueue([task, sub_start, sub_end]() {
+                    return MathSeries::calculate_range(task.series_type, sub_start, sub_end);
+                }));
+            }
+
+            for (auto& f : futures) {
+                total_task_sum += f.get();
+            }
+
+            last_processed_k = batch_end;
         }
 
-        // Собираем сумму со всех ядер
-        double task_sum = 0.0;
-        for (auto& f : futures) {
-            task_sum += f.get();
-        }
+        // Если дошли сюда — задача завершена полностью
+        std::cout << "[WORKER] Task #" << task.task_id << " 100% completed! Sending result.\n";
 
-        auto elapsed = std::chrono::duration<double>(
-            std::chrono::high_resolution_clock::now() - start_time).count();
-
-        std::cout << "[WORKER] Task #" << task.task_id 
-                  << " done in " << elapsed << "s! Sending partial sum: " << task_sum << "\n";
-
-        // Отправляем результат серверу
         Header resp_header{MessageType::TASK_COMPLETED, sizeof(TaskCompletedMsg)};
-        TaskCompletedMsg resp_body{task.task_id, task_sum};
+        TaskCompletedMsg resp_body{task.task_id, total_task_sum};
 
         asio::write(socket_, asio::buffer(&resp_header, sizeof(Header)));
         asio::write(socket_, asio::buffer(&resp_body, sizeof(TaskCompletedMsg)));
