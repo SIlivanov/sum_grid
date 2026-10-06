@@ -4,16 +4,20 @@
 #include "Worker.hpp"
 #include "Requester.hpp"
 
-// Обработчик сигнала Ctrl+C
 void signal_handler(int signal) {
     if (signal == SIGINT) {
-        std::cout << "\n[SIGNAL] SIGINT received! Graceful shutdown initiated...\n";
         g_stop_requested = true;
+        std::cout << "\n[SIGNAL] SIGINT (Ctrl+C) received!\n";
+
+        // Если воркер просто ждал задачу (не считал) закрываем сокет чтобы прервать блокирующий read
+        if (!g_is_computing && g_active_socket && g_active_socket->is_open()) {
+            std::error_code ec;
+            g_active_socket->close(ec);
+        }
     }
 }
 
 int main(int argc, char* argv[]) {
-    // Регистрируем перехват Ctrl+C
     std::signal(SIGINT, signal_handler);
 
     if (argc < 2) {
