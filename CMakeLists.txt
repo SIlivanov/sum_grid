@@ -14,3 +14,7 @@ endif()
 add_subdirectory(common)
 add_subdirectory(server)
 add_subdirectory(client)
+
+# Тестирование
+enable_testing()
+add_subdirectory(tests)
